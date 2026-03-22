@@ -1,5 +1,7 @@
 # Recursive Latent Forcing — Neural FSM via Training-Time Scaffolding
 
+> **📄 [Read the Full Research Paper → PAPER.md](PAPER.md)**
+
 A 130M-parameter Mamba2 SSM that learns **discrete, stepwise symbolic computation** using an auxiliary training-time gradient highway (Prompt Lifeline). Once trained, the model executes a self-contained Finite State Machine autonomously — the scaffold is no longer needed at inference.
 
 **Core Discovery**: State space models don't fail at reasoning — they fail at *learning to reason* due to temporal credit assignment collapse across recurrent depth. The Prompt Lifeline solves this by providing an O(1) gradient shortcut during BPTT. After convergence, the learned algorithm is fully internalized into the Mamba2 recurrent state.
