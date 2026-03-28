@@ -79,6 +79,7 @@
 /* SSM inference engine */
 #include "ssm_infer.h"
 #include "ssm_weights.h"
+#include <string.h>
 
 /* ── Model Format Detection ───────────────────────────────────────────────── */
 
@@ -129,6 +130,12 @@ static int    g_auto_tick      = 0;
 static int    g_auto_mode      = 0;   /* 0=normal, 1=degraded, 2=safe */
 static int    g_auto_interval  = 30;  /* seconds between autonomous ticks */
 static int    g_rlf_trace_on   = 0;
+static SsmTelemetry g_ssm_telem;
+
+/* Stub: OoHandoff receipt (full impl in llmk_oo.c) */
+typedef struct { int dummy; } OoHandoffReceipt;
+static inline void oo_receipt_init(OoHandoffReceipt *r, const MambaConfig *c, const char *a, const char *b) { (void)r; (void)c; (void)a; (void)b; }
+static inline int oo_receipt_serialize(OoHandoffReceipt *r, char *buf, int sz) { (void)r; (void)buf; (void)sz; return 0; }
 
 /* Generation settings */
 static int    g_max_gen_tokens = 256;
@@ -190,8 +197,9 @@ static ModelFormat detect_model_format(EFI_FILE_HANDLE f) {
     uefi_call_wrapper(f->SetPosition, 2, f, pos);
     if (EFI_ERROR(st) || n != 4) return MODEL_FMT_UNKNOWN;
 
-    /* MAMB = Mamba SSM */
-    if (magic[0] == 'M' && magic[1] == 'A' && magic[2] == 'M' && magic[3] == 'B') {
+    /* MAMB = Mamba SSM (compare as uint32_t to handle endianness) */
+    uint32_t magic_u32 = *(uint32_t *)magic;
+    if (magic_u32 == 0x4D414D42) {
         return MODEL_FMT_MAMBA;
     }
     /* GGUF */
@@ -580,23 +588,21 @@ static int handle_ssm_command(const CHAR16 *input) {
 
         Print(L"\r\n══ SSM TELEMETRY → OO ENGINE MAPPING ══════════════════\r\n\r\n");
 
-        /* memorion — lifeline gate (RAM dimension activity) */
-        Print(L"  memorion       │ Lifeline RAM: %.1f%% (%d/%d dims)\r\n",
-              (double)(telem.lifeline_ram_frac * 100.0f),
-              telem.lifeline_ram_dims, g_ssm_cfg.d_model);
+        /* memorion — lifeline gate mean/std */
+        Print(L"  memorion       │ Lifeline μ=%.4f σ=%.4f\r\n",
+              (double)telem.lifeline_mean, (double)telem.lifeline_std);
 
         /* diagnostion — gate statistics */
-        Print(L"  diagnostion    │ Gate μ=%.4f σ=%.4f\r\n",
+        Print(L"  diagnostion    │ Gate mean=%.4f std=%.4f\r\n",
               (double)telem.lifeline_mean, (double)telem.lifeline_std);
 
         /* calibrion — convergence rate */
-        Print(L"  calibrion      │ RLF loops: %d, conv_rate=%.4f\r\n",
-              telem.rlf_loops_used, (double)telem.rlf_convergence_rate);
+        Print(L"  calibrion      │ RLF loops: %d\r\n",
+              telem.rlf_loops_used);
 
-        /* synaption — ALU dimension activity */
-        Print(L"  synaption      │ Lifeline ALU: %.1f%% (%d/%d dims)\r\n",
-              (double)(telem.lifeline_alu_frac * 100.0f),
-              telem.lifeline_alu_dims, g_ssm_cfg.d_model);
+        /* synaption — hidden state health */
+        Print(L"  synaption      │ Hidden state norm: %.2f\r\n",
+              (double)telem.hidden_state_norm);
 
         /* evolvion — gate drift (from 1.0 initialization) */
         float drift = telem.lifeline_mean - 1.0f;
@@ -783,7 +789,7 @@ static int handle_ssm_command(const CHAR16 *input) {
                 Print(L"  │ ⚠ NaN/Inf detected → SAFE MODE, depth=1\r\n");
             } else if (g_ssm_telem.hidden_state_norm > 100.0f) {
                 g_auto_mode = 1;  /* degraded */
-                Print(L"  │ ⚠ ‖h‖=%.1f → DEGRADED\r\n", g_ssm_telem.hidden_state_norm);
+                Print(L"  │ ⚠ ‖h‖=%.1f → DEGRADED\r\n", (double)g_ssm_telem.hidden_state_norm);
             } else if (g_auto_mode != 0) {
                 g_auto_mode = 0;  /* auto-recover */
                 g_rlf_max_loops = 16;

@@ -1,13 +1,19 @@
 /*
- * ssm_infer.c — Mamba2 SSM Inference Engine for Bare Metal
+ * ssm_infer.c — Mamba2 Multi-Head SSM Inference Engine for Bare Metal
  *
  * Pure-C implementation of:
- *   1. Mamba2 selective scan (SSM forward pass)
+ *   1. Mamba2 multi-head selective scan (fused in_proj, per-head SSM)
  *   2. Recursive Latent Forcing (RLF) inference loop
  *   3. RoPE loop encoding + Prompt Lifeline injection
+ *   4. Latent Bridge (low-rank translation)
  *
- * Ported from mamba2backbonerecursion/mamba_scan_kernel.cu
- * and training/finetune_mamba2_130m_v34.py.
+ * Architecture per block:
+ *   in_proj(x) → [z, xBC, dt]
+ *   conv1d(xBC) → SiLU → split [x, B, C]
+ *   inner_norm(x)
+ *   SSM scan per-head: h = A*h + B*x, y = C*h + D*x
+ *   gate: y = z * SiLU(y)
+ *   out_proj(y)
  *
  * Created for llm-baremetal (Djiby Diop) by batteryphil.
  */
@@ -17,10 +23,9 @@
 #include <string.h>
 #include <math.h>
 
-/* ── Portable min/max ──────────────────────────────────────────────────────── */
+/* ── Portable helpers ─────────────────────────────────────────────────────── */
 
 static inline int  ssm_min_i(int a, int b)   { return a < b ? a : b; }
-static inline int  ssm_max_i(int a, int b)   { return a > b ? a : b; }
 static inline float ssm_absf(float x)        { return x < 0.0f ? -x : x; }
 
 /* ── Config Default ───────────────────────────────────────────────────────── */
@@ -28,26 +33,44 @@ static inline float ssm_absf(float x)        { return x < 0.0f ? -x : x; }
 void mamba_config_default(MambaConfig *cfg)
 {
     /**
-     * Default config for Mamba2-130m + RLF v34.
+     * Default config for Mamba2-2.7B + RLF w/ Prefix Scratchpad.
      */
     if (!cfg) return;
     memset(cfg, 0, sizeof(*cfg));
 
-    cfg->d_model      = 768;
-    cfg->d_state      = 64;     /* LOOP_D_STATE from v34 */
+    cfg->d_model      = 2560;
+    cfg->d_state      = 128;
     cfg->d_conv       = 4;
     cfg->expand        = 2;
-    cfg->d_inner       = cfg->d_model * cfg->expand;   /* 1536 */
-    cfg->n_layers      = 24;
-    cfg->vocab_size    = 50282;  /* gpt-neox-20b + <THINK> + <HALT> */
-    cfg->max_seq_len   = 256;
+    cfg->d_inner       = 5120;
+    cfg->n_layers      = 64;
+    cfg->vocab_size    = 50288;
+    cfg->max_seq_len   = 512;
 
-    cfg->base_split    = 6;
-    cfg->max_rlf_loops = 16;
-    cfg->halt_token_id = 50281;  /* Typical <HALT> ID after add_special_tokens */
+    /* Mamba2 multi-head */
+    cfg->nheads        = 80;
+    cfg->headdim       = 64;
+    cfg->ngroups       = 1;
+    cfg->conv_dim      = cfg->d_inner + 2 * cfg->ngroups * cfg->d_state;  /* 5376 */
+    cfg->in_proj_dim   = 2 * cfg->d_inner + 2 * cfg->ngroups * cfg->d_state + cfg->nheads; /* 10576 */
 
+    /* RLF */
+    cfg->base_split    = 48;
+    cfg->max_rlf_loops = 6;
+    cfg->halt_token_id = 50278;
     cfg->rope_base     = 10000;
-    cfg->lifeline_enabled = 1;  /* Lifeline ON by default */
+    cfg->lifeline_enabled = 1;
+
+    /* Scratchpad + Bridge */
+    cfg->prefix_m     = 8;
+    cfg->bridge_rank  = 64;
+
+    /* Loop engine */
+    cfg->loop_nheads   = 20;
+    cfg->loop_headdim  = 128;
+    cfg->loop_d_state  = 32;
+    cfg->loop_d_inner  = 2560;  /* d_model * 1 (expand=1) */
+    cfg->loop_conv_dim = cfg->loop_d_inner + 2 * 1 * cfg->loop_d_state; /* 2624 */
 }
 
 /* ── Math Utilities ───────────────────────────────────────────────────────── */
@@ -66,55 +89,35 @@ void ssm_rmsnorm(float *x_out, const float *x_in, const float *weight, int d)
      * RMSNorm: out[i] = weight[i] * x_in[i] / sqrt(mean(x_in^2) + eps).
      */
     if (!x_out || !x_in || !weight || d <= 0) return;
-
     float ss = 0.0f;
-    for (int i = 0; i < d; i++) {
-        ss += x_in[i] * x_in[i];
-    }
+    for (int i = 0; i < d; i++) ss += x_in[i] * x_in[i];
     ss = 1.0f / sqrtf(ss / (float)d + 1e-5f);
-    for (int i = 0; i < d; i++) {
-        x_out[i] = weight[i] * x_in[i] * ss;
-    }
+    for (int i = 0; i < d; i++) x_out[i] = weight[i] * x_in[i] * ss;
 }
 
 void ssm_softmax(float *v, int n)
 {
     /**
-     * In-place softmax with numerical stability (max subtraction).
+     * In-place softmax with numerical stability.
      */
     if (!v || n <= 0) return;
-
     float max_val = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > max_val) max_val = v[i];
-    }
+    for (int i = 1; i < n; i++) if (v[i] > max_val) max_val = v[i];
     float sum = 0.0f;
-    for (int i = 0; i < n; i++) {
-        v[i] = expf(v[i] - max_val);
-        sum += v[i];
-    }
-    if (sum > 0.0f) {
-        float inv = 1.0f / sum;
-        for (int i = 0; i < n; i++) {
-            v[i] *= inv;
-        }
-    }
+    for (int i = 0; i < n; i++) { v[i] = expf(v[i] - max_val); sum += v[i]; }
+    if (sum > 0.0f) { float inv = 1.0f / sum; for (int i = 0; i < n; i++) v[i] *= inv; }
 }
 
 void ssm_matvec(float *out, const float *W, const float *x, int m, int n)
 {
     /**
      * Matrix-vector multiply: out[m] = W[m,n] @ x[n].
-     * W is row-major: W[i*n + j].
      */
     if (!out || !W || !x || m <= 0 || n <= 0) return;
-
     for (int i = 0; i < m; i++) {
         float acc = 0.0f;
-        const float *row = W + i * n;
-        for (int j = 0; j < n; j++) {
-            acc += row[j] * x[j];
-        }
+        const float *row = W + (int64_t)i * n;
+        for (int j = 0; j < n; j++) acc += row[j] * x[j];
         out[i] = acc;
     }
 }
@@ -122,16 +125,13 @@ void ssm_matvec(float *out, const float *W, const float *x, int m, int n)
 void ssm_matvec_acc(float *out, const float *W, const float *x, int m, int n)
 {
     /**
-     * Matrix-vector multiply with accumulate: out[m] += W[m,n] @ x[n].
+     * Matrix-vector multiply with accumulate.
      */
     if (!out || !W || !x || m <= 0 || n <= 0) return;
-
     for (int i = 0; i < m; i++) {
         float acc = 0.0f;
-        const float *row = W + i * n;
-        for (int j = 0; j < n; j++) {
-            acc += row[j] * x[j];
-        }
+        const float *row = W + (int64_t)i * n;
+        for (int j = 0; j < n; j++) acc += row[j] * x[j];
         out[i] += acc;
     }
 }
@@ -140,143 +140,21 @@ void ssm_rope_apply(float *x, int d_model, int loop_index, int rope_base)
 {
     /**
      * Apply 1D RoPE rotation for a given loop index.
-     *
-     * Ported from LoopRoPE in finetune_mamba2_130m_v34.py:
-     *   inv_freq = 1.0 / (base ** (arange(0, d, 2) / d))
-     *   freqs = loop_index * inv_freq
-     *   x_out = x * cos(freqs) + rotate_half(x) * sin(freqs)
-     *
-     * The rotation makes the model's representation of "I am at loop N"
-     * a continuous function of N rather than a table lookup.
      */
     if (!x || d_model <= 0) return;
-
     int half_d = d_model / 2;
     float n = (float)loop_index;
-
     for (int i = 0; i < half_d; i++) {
-        /* Frequency band for dimension pair i */
         float theta = 1.0f / powf((float)rope_base, (float)(2 * i) / (float)d_model);
         float freq = n * theta;
         float cos_f = cosf(freq);
         float sin_f = sinf(freq);
-
-        /* Apply rotation to pair (x[2i], x[2i+1]) */
-        int idx0 = 2 * i;
-        int idx1 = 2 * i + 1;
+        int idx0 = 2 * i, idx1 = 2 * i + 1;
         if (idx1 >= d_model) break;
-
-        float x0 = x[idx0];
-        float x1 = x[idx1];
+        float x0 = x[idx0], x1 = x[idx1];
         x[idx0] = x0 * cos_f - x1 * sin_f;
         x[idx1] = x0 * sin_f + x1 * cos_f;
     }
-}
-
-/* ── SSM Selective Scan (Core Kernel) ─────────────────────────────────────── */
-
-/**
- * Single-step selective scan for one SSM block.
- *
- * This is the pure-C equivalent of mamba_scan_kernel.cu:
- *   h[n] = exp(dt * A[n]) * h[n] + dt * B[n] * x
- *   y += h[n] * C[n]
- *   y_final = y + x * D_param
- *
- * Arguments:
- *   y_out:    output [d_inner]
- *   x_in:     input after conv+gate [d_inner]
- *   dt:       time step [d_inner]
- *   B_vec:    input-dependent SSM matrix row [d_state]
- *   C_vec:    input-dependent SSM matrix row [d_state]
- *   A_log:    log of diagonal A [d_inner, d_state]
- *   D_param:  feed-through [d_inner]
- *   h_state:  running SSM hidden state [d_inner * d_state] (modified in place!)
- *   d_inner:  inner dimension
- *   d_state:  SSM state dimension N
- */
-static void ssm_selective_scan_step(
-    float       *y_out,
-    const float *x_in,
-    const float *dt,
-    const float *B_vec,
-    const float *C_vec,
-    const float *A_log,
-    const float *D_param,
-    float       *h_state,
-    int          d_inner,
-    int          d_state
-)
-{
-    /**
-     * Core SSM scan kernel ported from CUDA shared-memory implementation.
-     */
-    for (int d = 0; d < d_inner; d++) {
-        float x_t  = x_in[d];
-        float dt_t = dt[d];
-        float y_t  = 0.0f;
-
-        float *h = h_state + d * d_state;
-        const float *A_row = A_log + d * d_state;
-
-        for (int n = 0; n < d_state; n++) {
-            /* A is stored as log — exponentiate: A_real = -exp(A_log) */
-            float A_val = -expf(A_row[n]);
-            float r = expf(dt_t * A_val);
-            float b_bar = dt_t * B_vec[n];
-
-            h[n] = r * h[n] + b_bar * x_t;
-            y_t += h[n] * C_vec[n];
-        }
-
-        y_out[d] = y_t + x_t * D_param[d];
-    }
-}
-
-/* ── Conv1d Step ──────────────────────────────────────────────────────────── */
-
-/**
- * Single-step causal conv1d using circular buffer.
- *
- * conv_buf: [d_inner * d_conv] circular buffer
- * conv_w:  [d_inner, d_conv] conv weights
- * conv_b:  [d_inner] conv bias
- * x_in:    [d_inner] current input (stored into circular buffer)
- * x_out:   [d_inner] convolution output
- * conv_pos: pointer to circular buffer position (modified!)
- */
-static void ssm_conv1d_step(
-    float       *x_out,
-    const float *x_in,
-    float       *conv_buf,
-    int         *conv_pos,
-    const float *conv_w,
-    const float *conv_b,
-    int          d_inner,
-    int          d_conv
-)
-{
-    /**
-     * Causal 1D convolution with circular buffer for streaming inference.
-     */
-    int pos = *conv_pos;
-
-    /* Store current input into circular buffer */
-    for (int d = 0; d < d_inner; d++) {
-        conv_buf[d * d_conv + pos] = x_in[d];
-    }
-
-    /* Compute convolution */
-    for (int d = 0; d < d_inner; d++) {
-        float acc = conv_b ? conv_b[d] : 0.0f;
-        for (int k = 0; k < d_conv; k++) {
-            int buf_idx = (pos - d_conv + 1 + k + d_conv * 256) % d_conv;
-            acc += conv_buf[d * d_conv + buf_idx] * conv_w[d * d_conv + k];
-        }
-        x_out[d] = acc;
-    }
-
-    *conv_pos = (pos + 1) % d_conv;
 }
 
 /* ── State Management ─────────────────────────────────────────────────────── */
@@ -284,29 +162,21 @@ static void ssm_conv1d_step(
 int mamba_state_alloc(MambaState *state, const MambaConfig *cfg)
 {
     /**
-     * Allocate running state buffers for Mamba inference.
+     * Allocate running state buffers for Mamba2 inference.
      */
     if (!state || !cfg) return -1;
     memset(state, 0, sizeof(*state));
 
-    int d_inner = cfg->d_inner;
-
-    /* Conv buffer: [n_layers * d_inner * d_conv] */
-    size_t conv_bytes = (size_t)cfg->n_layers * d_inner * cfg->d_conv * sizeof(float);
+    /* Conv buffer: [n_layers * conv_dim * d_conv] */
+    size_t conv_bytes = (size_t)cfg->n_layers * cfg->conv_dim * cfg->d_conv * sizeof(float);
     state->conv_buf = (float *)calloc(1, conv_bytes);
     if (!state->conv_buf) return -1;
 
-    /* SSM state: [n_layers * d_inner * d_state] */
-    size_t ssm_bytes = (size_t)cfg->n_layers * d_inner * cfg->d_state * sizeof(float);
+    /* SSM state: [n_layers * nheads * headdim * d_state] */
+    size_t ssm_bytes = (size_t)cfg->n_layers * cfg->nheads * cfg->headdim * cfg->d_state * sizeof(float);
     state->ssm_state = (float *)calloc(1, ssm_bytes);
-    if (!state->ssm_state) {
-        free(state->conv_buf);
-        state->conv_buf = NULL;
-        return -1;
-    }
+    if (!state->ssm_state) { free(state->conv_buf); state->conv_buf = NULL; return -1; }
 
-    state->conv_pos = 0;
-    state->seq_pos = 0;
     return 0;
 }
 
@@ -316,10 +186,8 @@ void mamba_state_free(MambaState *state)
      * Free all running state buffers.
      */
     if (!state) return;
-    if (state->conv_buf) { free(state->conv_buf); state->conv_buf = NULL; }
-    if (state->ssm_state) { free(state->ssm_state); state->ssm_state = NULL; }
-    state->conv_pos = 0;
-    state->seq_pos = 0;
+    free(state->conv_buf); state->conv_buf = NULL;
+    free(state->ssm_state); state->ssm_state = NULL;
 }
 
 void mamba_state_reset(MambaState *state, const MambaConfig *cfg)
@@ -328,22 +196,17 @@ void mamba_state_reset(MambaState *state, const MambaConfig *cfg)
      * Reset state to zeros for a new sequence.
      */
     if (!state || !cfg) return;
-    int d_inner = cfg->d_inner;
-    if (state->conv_buf) {
-        memset(state->conv_buf, 0,
-               (size_t)cfg->n_layers * d_inner * cfg->d_conv * sizeof(float));
-    }
-    if (state->ssm_state) {
-        memset(state->ssm_state, 0,
-               (size_t)cfg->n_layers * d_inner * cfg->d_state * sizeof(float));
-    }
+    if (state->conv_buf)
+        memset(state->conv_buf, 0, (size_t)cfg->n_layers * cfg->conv_dim * cfg->d_conv * sizeof(float));
+    if (state->ssm_state)
+        memset(state->ssm_state, 0, (size_t)cfg->n_layers * cfg->nheads * cfg->headdim * cfg->d_state * sizeof(float));
     state->conv_pos = 0;
     state->seq_pos = 0;
 }
 
-/* ── Single Mamba Block Forward ───────────────────────────────────────────── */
+/* ── Mamba2 Block Forward (Single Token) ──────────────────────────────────── */
 
-void mamba_block_forward(
+void mamba2_block_forward(
     float       *x_out,
     const float *x_in,
     int          layer_idx,
@@ -353,106 +216,149 @@ void mamba_block_forward(
 )
 {
     /**
-     * Forward pass through one Mamba2 SSM block (single token).
+     * Forward pass through one Mamba2 multi-head SSM block.
      *
-     * Architecture per block:
-     *   1. RMSNorm
-     *   2. in_proj → (gate, x) split
-     *   3. Conv1d (causal, d_conv=4)
-     *   4. SiLU activation on x
-     *   5. SSM scan: x_proj → (dt, B, C); selective scan with h state
-     *   6. Gate: y = silu(gate) * scan_output
-     *   7. out_proj
-     *   8. Residual add
+     * 1. RMSNorm(x)
+     * 2. in_proj: [in_proj_dim, d_model] @ x → [z, xBC, dt]
+     * 3. Conv1d on xBC (causal, d_conv=4)
+     * 4. SiLU on xBC
+     * 5. Split xBC → [x_ssm, B, C]
+     * 6. Inner RMSNorm on x_ssm
+     * 7. Per-head SSM scan: h = A*h + B*x, y = h*C + D*x
+     * 8. Gate: out = z * SiLU(y_flat)  [wait, Mamba2 gates differently]
+     *    Actually: out = y_flat * SiLU(z)
+     * 9. out_proj + residual
      */
-    int d_model = cfg->d_model;
-    int d_inner = cfg->d_inner;
-    int d_state = cfg->d_state;
-    int d_conv  = cfg->d_conv;
-    int dt_rank = d_model;  /* Mamba2 uses dt_rank == d_model by default */
+    int d_model   = cfg->d_model;
+    int d_inner   = cfg->d_inner;
+    int d_state   = cfg->d_state;
+    int d_conv    = cfg->d_conv;
+    int nheads    = cfg->nheads;
+    int headdim   = cfg->headdim;
+    int ngroups   = cfg->ngroups;
+    int conv_dim  = cfg->conv_dim;
+    int in_proj_d = cfg->in_proj_dim;
 
-    /* Scratch buffers — stack allocated for typical sizes */
-    float norm_buf[2048];     /* d_model */
-    float proj_buf[4096];     /* 2 * d_inner */
-    float conv_out[2048];     /* d_inner */
-    float xbc_buf[4096];      /* dt_rank + 2*d_state */
-    float dt_buf[2048];       /* d_inner */
-    float scan_out[2048];     /* d_inner */
-    float gated[2048];        /* d_inner */
+    /* Heap buffers */
+    float *norm_buf  = (float *)malloc(d_model * sizeof(float));
+    float *proj_buf  = (float *)malloc(in_proj_d * sizeof(float));
+    float *conv_out  = (float *)malloc(conv_dim * sizeof(float));
+    float *y_out     = (float *)malloc(d_inner * sizeof(float));
+    float *gated     = (float *)malloc(d_inner * sizeof(float));
 
-    /* Safety: clip to stack buffer sizes */
-    if (d_model > 2048 || d_inner > 2048) {
-        /* Fall through: copy input to output as identity */
+    if (!norm_buf || !proj_buf || !conv_out || !y_out || !gated) {
         memcpy(x_out, x_in, d_model * sizeof(float));
+        free(norm_buf); free(proj_buf); free(conv_out); free(y_out); free(gated);
         return;
     }
 
-    /* 1. RMSNorm */
-    ssm_rmsnorm(norm_buf, x_in, wt->norm_weight[layer_idx], d_model);
+    /* 1. Layer RMSNorm */
+    ssm_rmsnorm(norm_buf, x_in, wt->layer_norm[layer_idx], d_model);
 
-    /* 2. in_proj: [2*d_inner, d_model] @ x → (gate, x_ssm) */
-    ssm_matvec(proj_buf, wt->in_proj_weight[layer_idx], norm_buf, 2 * d_inner, d_model);
-    float *gate_vec = proj_buf;            /* first d_inner */
-    float *x_ssm    = proj_buf + d_inner;  /* second d_inner */
+    /* 2. in_proj: fused [z, xBC, dt] projection */
+    ssm_matvec(proj_buf, wt->in_proj[layer_idx], norm_buf, in_proj_d, d_model);
 
-    /* 3. Conv1d (causal) */
-    float *layer_conv_buf = state->conv_buf +
-        (size_t)layer_idx * d_inner * d_conv;
-    int conv_pos = state->conv_pos;
-    ssm_conv1d_step(conv_out, x_ssm, layer_conv_buf, &conv_pos,
-                    wt->conv1d_weight[layer_idx],
-                    wt->conv1d_bias[layer_idx],
-                    d_inner, d_conv);
+    /* Split: z[d_inner], xBC[conv_dim], dt[nheads] */
+    float *z_vec    = proj_buf;                          /* [d_inner] */
+    float *xBC_vec  = proj_buf + d_inner;                /* [conv_dim] = d_inner + 2*ngroups*d_state */
+    float *dt_vec   = proj_buf + d_inner + conv_dim;     /* [nheads] */
 
-    /* 4. SiLU on conv output */
-    for (int i = 0; i < d_inner; i++) {
-        conv_out[i] = ssm_silu(conv_out[i]);
-    }
-
-    /* 5. x_proj → (dt, B, C) */
-    int xbc_dim = dt_rank + 2 * d_state;
-    if (xbc_dim > 4096) xbc_dim = 4096;
-    ssm_matvec(xbc_buf, wt->x_proj_weight[layer_idx], conv_out, xbc_dim, d_inner);
-
-    float *dt_raw   = xbc_buf;
-    float *B_vec    = xbc_buf + dt_rank;
-    float *C_vec    = xbc_buf + dt_rank + d_state;
-
-    /* dt_proj: [d_inner, dt_rank] @ dt_raw + bias → dt */
-    ssm_matvec(dt_buf, wt->dt_proj_weight[layer_idx], dt_raw, d_inner, dt_rank);
-    if (wt->dt_proj_bias[layer_idx]) {
-        for (int i = 0; i < d_inner; i++) {
-            dt_buf[i] += wt->dt_proj_bias[layer_idx][i];
+    /* dt = softplus(dt + dt_bias) */
+    if (wt->dt_bias[layer_idx]) {
+        for (int i = 0; i < nheads; i++) {
+            dt_vec[i] += wt->dt_bias[layer_idx][i];
+            dt_vec[i] = logf(1.0f + expf(dt_vec[i]));
         }
     }
-    /* Softplus on dt */
-    for (int i = 0; i < d_inner; i++) {
-        dt_buf[i] = logf(1.0f + expf(dt_buf[i]));
+
+    /* 3. Conv1d on xBC (causal with circular buffer) */
+    float *layer_conv = state->conv_buf + (size_t)layer_idx * conv_dim * d_conv;
+    int pos = state->conv_pos;
+
+    /* Store current xBC into circular buffer */
+    for (int d = 0; d < conv_dim; d++) {
+        layer_conv[d * d_conv + pos] = xBC_vec[d];
     }
 
-    /* 6. Selective scan */
+    /* Compute convolution */
+    for (int d = 0; d < conv_dim; d++) {
+        float acc = wt->conv1d_bias[layer_idx] ? wt->conv1d_bias[layer_idx][d] : 0.0f;
+        for (int k = 0; k < d_conv; k++) {
+            int buf_idx = (pos - d_conv + 1 + k + d_conv * 256) % d_conv;
+            acc += layer_conv[d * d_conv + buf_idx] * wt->conv1d_weight[layer_idx][d * d_conv + k];
+        }
+        conv_out[d] = acc;
+    }
+
+    /* 4. SiLU on the conv output */
+    for (int d = 0; d < conv_dim; d++) {
+        conv_out[d] = ssm_silu(conv_out[d]);
+    }
+
+    /* 5. Split conv_out → [x_ssm, B, C] */
+    float *x_ssm = conv_out;                                   /* [d_inner] */
+    float *B_flat = conv_out + d_inner;                         /* [ngroups * d_state] */
+    float *C_flat = conv_out + d_inner + ngroups * d_state;     /* [ngroups * d_state] */
+
+    /* 6. Inner RMSNorm on x_ssm */
+    if (wt->inner_norm[layer_idx]) {
+        float *x_tmp = (float *)malloc(d_inner * sizeof(float));
+        if (x_tmp) {
+            memcpy(x_tmp, x_ssm, d_inner * sizeof(float));
+            ssm_rmsnorm(x_ssm, x_tmp, wt->inner_norm[layer_idx], d_inner);
+            free(x_tmp);
+        }
+    }
+
+    /* 7. Per-head SSM scan */
+    /* State layout: [n_layers, nheads, headdim, d_state] */
     float *layer_h = state->ssm_state +
-        (size_t)layer_idx * d_inner * d_state;
-    ssm_selective_scan_step(scan_out, conv_out, dt_buf,
-                            B_vec, C_vec,
-                            wt->A_log[layer_idx],
-                            wt->D[layer_idx],
-                            layer_h,
-                            d_inner, d_state);
+        (size_t)layer_idx * nheads * headdim * d_state;
 
-    /* 7. Gate: y = silu(gate) * scan_output */
+    int heads_per_group = nheads / ngroups;
+
+    for (int head = 0; head < nheads; head++) {
+        int grp = head / heads_per_group;
+        float *B_vec = B_flat + grp * d_state;
+        float *C_vec = C_flat + grp * d_state;
+        float *h     = layer_h + (size_t)head * headdim * d_state;
+        float *x_h   = x_ssm + head * headdim;
+        float *y_h   = y_out + head * headdim;
+
+        float A_val = -expf(wt->A_log[layer_idx][head]);
+        float dt_h  = dt_vec[head];
+        float D_h   = wt->D[layer_idx] ? wt->D[layer_idx][head] : 1.0f;
+
+        for (int d = 0; d < headdim; d++) {
+            float x_t = x_h[d];
+            float y_t = 0.0f;
+
+            for (int n = 0; n < d_state; n++) {
+                float r = expf(dt_h * A_val);
+                float b_bar = dt_h * B_vec[n];
+                h[d * d_state + n] = r * h[d * d_state + n] + b_bar * x_t;
+                y_t += h[d * d_state + n] * C_vec[n];
+            }
+
+            y_h[d] = y_t + D_h * x_t;
+        }
+    }
+
+    /* 8. Gate: out = y * SiLU(z) */
     for (int i = 0; i < d_inner; i++) {
-        gated[i] = ssm_silu(gate_vec[i]) * scan_out[i];
+        gated[i] = y_out[i] * ssm_silu(z_vec[i]);
     }
 
-    /* 8. out_proj + residual */
-    ssm_matvec(x_out, wt->out_proj_weight[layer_idx], gated, d_model, d_inner);
+    /* 9. out_proj + residual */
+    ssm_matvec(x_out, wt->out_proj[layer_idx], gated, d_model, d_inner);
     for (int i = 0; i < d_model; i++) {
-        x_out[i] += x_in[i];  /* Residual connection */
+        x_out[i] += x_in[i];
     }
+
+    free(norm_buf); free(proj_buf); free(conv_out); free(y_out); free(gated);
 }
 
-/* ── Full Model Forward (Single Token) ────────────────────────────────────── */
+/* ── Full Model Forward ───────────────────────────────────────────────────── */
 
 void mamba_forward(
     float       *x,
@@ -463,12 +369,7 @@ void mamba_forward(
 )
 {
     /**
-     * Full Mamba forward pass for a single token.
-     *
-     * 1. Embed token → x[d_model]
-     * 2. For each layer: mamba_block_forward (norm → proj → conv → SSM → gate → proj + residual)
-     * 3. Final norm
-     * (Caller applies lm_head to get logits)
+     * Full Mamba2 forward pass for a single token.
      */
     int d_model = cfg->d_model;
 
@@ -479,11 +380,11 @@ void mamba_forward(
     }
 
     /* 2. Layer-by-layer forward */
-    float x_buf[2048];
-    if (d_model > 2048) return;
+    float *x_buf = (float *)malloc(d_model * sizeof(float));
+    if (!x_buf) return;
 
     for (int l = 0; l < cfg->n_layers; l++) {
-        mamba_block_forward(x_buf, x, l, cfg, wt, state);
+        mamba2_block_forward(x_buf, x, l, cfg, wt, state);
         memcpy(x, x_buf, d_model * sizeof(float));
     }
 
@@ -492,185 +393,160 @@ void mamba_forward(
         memcpy(x_buf, x, d_model * sizeof(float));
         ssm_rmsnorm(x, x_buf, wt->final_norm_weight, d_model);
     }
+    free(x_buf);
 
+    state->conv_pos = (state->conv_pos + 1) % cfg->d_conv;
     state->seq_pos++;
 }
 
-/* ── Logits + Sampling ────────────────────────────────────────────────────── */
+/* ── Argmax / Sampling ────────────────────────────────────────────────────── */
 
 static int ssm_argmax(const float *v, int n)
 {
     /**
-     * Return index of maximum value in v[n].
+     * Return index of maximum value.
      */
     if (!v || n <= 0) return 0;
     int best = 0;
-    float best_val = v[0];
-    for (int i = 1; i < n; i++) {
-        if (v[i] > best_val) {
-            best_val = v[i];
-            best = i;
-        }
-    }
+    for (int i = 1; i < n; i++) if (v[i] > v[best]) best = i;
     return best;
-}
-
-static int ssm_sample_topk(const float *logits, int vocab, float temp, int top_k)
-{
-    /**
-     * Temperature-scaled top-k sampling.
-     */
-    if (!logits || vocab <= 0) return 0;
-    if (temp <= 0.0f || top_k <= 1) return ssm_argmax(logits, vocab);
-
-    /* Apply temperature */
-    float *probs = (float *)malloc(vocab * sizeof(float));
-    if (!probs) return ssm_argmax(logits, vocab);
-
-    for (int i = 0; i < vocab; i++) {
-        probs[i] = logits[i] / temp;
-    }
-    ssm_softmax(probs, vocab);
-
-    /* Simple greedy for now (top-k sorting is expensive in bare-metal) */
-    int tok = ssm_argmax(probs, vocab);
-    free(probs);
-    return tok;
-}
-
-/* ── RLF Recursive Loop SSM Block ─────────────────────────────────────────── */
-
-/**
- * Forward pass through the RLF loop's dedicated Mamba2 core block.
- * This is the "reasoning engine" that runs inside the recursive loop.
- *
- * x: [d_model] hidden state (modified in place, residual added)
- */
-static void ssm_rlf_loop_block(
-    float       *x,
-    const MambaConfig  *cfg,
-    const MambaWeights *wt
-)
-{
-    /**
-     * Mamba2 loop core block (the recursive reasoning SSM).
-     *
-     * Mirrors mamba2_core in RecursiveMamba2_v34:
-     *   x = x + self.mamba2_core(x)
-     *   x = self.loop_norm(x)
-     */
-    int d_model = cfg->d_model;
-    int d_inner = d_model * cfg->expand;
-    int d_state = cfg->d_state;
-    int dt_rank = d_model;
-
-    /* Stack scratch buffers */
-    float proj_buf[4096];
-    float conv_out[2048];
-    float xbc_buf[4096];
-    float dt_buf[2048];
-    float scan_out[2048];
-    float gated[2048];
-    float proj_out[2048];
-
-    if (d_model > 2048 || d_inner > 2048) return;
-
-    /* in_proj: (gate, x) */
-    if (wt->loop_in_proj) {
-        ssm_matvec(proj_buf, wt->loop_in_proj, x, 2 * d_inner, d_model);
-    } else {
-        memset(proj_buf, 0, 2 * d_inner * sizeof(float));
-    }
-    float *gate_vec = proj_buf;
-    float *x_ssm    = proj_buf + d_inner;
-
-    /* Conv1d (no state tracking for loop core — uses input directly) */
-    for (int i = 0; i < d_inner; i++) {
-        conv_out[i] = ssm_silu(x_ssm[i]);
-    }
-
-    /* x_proj → (dt, B, C) */
-    int xbc_dim = dt_rank + 2 * d_state;
-    if (wt->loop_x_proj) {
-        ssm_matvec(xbc_buf, wt->loop_x_proj, conv_out,
-                   ssm_min_i(xbc_dim, 4096), d_inner);
-    } else {
-        memset(xbc_buf, 0, xbc_dim * sizeof(float));
-    }
-
-    float *dt_raw = xbc_buf;
-    float *B_vec  = xbc_buf + dt_rank;
-    float *C_vec  = xbc_buf + dt_rank + d_state;
-
-    /* dt_proj + softplus */
-    if (wt->loop_dt_proj_weight) {
-        ssm_matvec(dt_buf, wt->loop_dt_proj_weight, dt_raw, d_inner, dt_rank);
-    } else {
-        memset(dt_buf, 0, d_inner * sizeof(float));
-    }
-    if (wt->loop_dt_proj_bias) {
-        for (int i = 0; i < d_inner; i++) dt_buf[i] += wt->loop_dt_proj_bias[i];
-    }
-    for (int i = 0; i < d_inner; i++) {
-        dt_buf[i] = logf(1.0f + expf(dt_buf[i]));
-    }
-
-    /* Selective scan (use A_log, D from loop core) */
-    /* Temporary zero h-state per loop iteration (stateless reasoning) */
-    float *h_temp = (float *)calloc(d_inner * d_state, sizeof(float));
-    if (h_temp) {
-        ssm_selective_scan_step(scan_out, conv_out, dt_buf,
-                               B_vec, C_vec,
-                               wt->loop_A_log  ? wt->loop_A_log  : wt->A_log[0],
-                               wt->loop_D      ? wt->loop_D      : wt->D[0],
-                               h_temp, d_inner, d_state);
-        free(h_temp);
-    }
-
-    /* Gate */
-    for (int i = 0; i < d_inner; i++) {
-        gated[i] = ssm_silu(gate_vec[i]) * scan_out[i];
-    }
-
-    /* out_proj */
-    if (wt->loop_out_proj) {
-        ssm_matvec(proj_out, wt->loop_out_proj, gated, d_model, d_inner);
-    } else {
-        memset(proj_out, 0, d_model * sizeof(float));
-    }
-
-    /* Residual add: x = x + mamba2_core(x) */
-    for (int i = 0; i < d_model; i++) {
-        x[i] += proj_out[i];
-    }
-
-    /* Loop norm */
-    if (wt->loop_norm_weight) {
-        float tmp[2048];
-        memcpy(tmp, x, d_model * sizeof(float));
-        ssm_rmsnorm(x, tmp, wt->loop_norm_weight, d_model);
-    }
 }
 
 /* ── Lifeline Injection ───────────────────────────────────────────────────── */
 
-static void ssm_lifeline_inject(
-    float       *x,
-    const float *x_prompt,
-    const float *gate,
-    int          d_model
+static void ssm_lifeline_inject(float *x, const float *x_prompt, const float *gate, int d)
+{
+    /**
+     * Prompt Lifeline: x += gate * x_prompt.
+     */
+    if (!x || !x_prompt || !gate) return;
+    for (int i = 0; i < d; i++) x[i] += gate[i] * x_prompt[i];
+}
+
+/* ── RLF Loop Core Block ─────────────────────────────────────────────────── */
+
+static void ssm_rlf_loop_block(
+    float *x,
+    const MambaConfig *cfg,
+    const MambaWeights *wt
 )
 {
     /**
-     * Prompt Lifeline injection: x = x + gate * x_prompt.
-     * This provides the O(1) gradient shortcut during training.
-     * At inference, the gate values have been learned to selectively
-     * route prompt information through the recursive loop.
+     * Mamba2 loop core block (recursive reasoning engine).
+     * x = x + loop_mamba2(x), then loop_norm(x).
      */
-    if (!x || !x_prompt || !gate) return;
-    for (int i = 0; i < d_model; i++) {
-        x[i] += gate[i] * x_prompt[i];
+    int d_model      = cfg->d_model;
+    int loop_nheads   = cfg->loop_nheads;
+    int loop_headdim  = cfg->loop_headdim;
+    int loop_d_state  = cfg->loop_d_state;
+    int loop_d_inner  = cfg->loop_d_inner;
+    int loop_conv_dim = cfg->loop_conv_dim;
+    int d_conv        = cfg->d_conv;
+
+    /* Compute in_proj_dim for loop */
+    int loop_in_proj_dim = 2 * loop_d_inner + 2 * 1 * loop_d_state + loop_nheads;
+
+    float *proj_buf  = (float *)malloc(loop_in_proj_dim * sizeof(float));
+    float *conv_out  = (float *)malloc(loop_conv_dim * sizeof(float));
+    float *y_out     = (float *)malloc(loop_d_inner * sizeof(float));
+    float *proj_out  = (float *)malloc(d_model * sizeof(float));
+
+    if (!proj_buf || !conv_out || !y_out || !proj_out) {
+        free(proj_buf); free(conv_out); free(y_out); free(proj_out);
+        return;
     }
+
+    /* in_proj */
+    if (wt->loop_in_proj)
+        ssm_matvec(proj_buf, wt->loop_in_proj, x, loop_in_proj_dim, d_model);
+    else
+        memset(proj_buf, 0, loop_in_proj_dim * sizeof(float));
+
+    float *z_vec   = proj_buf;
+    float *xBC_vec = proj_buf + loop_d_inner;
+    float *dt_vec  = proj_buf + loop_d_inner + loop_conv_dim;
+
+    /* dt = softplus(dt + dt_bias) */
+    if (wt->loop_dt_bias) {
+        for (int i = 0; i < loop_nheads; i++) {
+            dt_vec[i] += wt->loop_dt_bias[i];
+            dt_vec[i] = logf(1.0f + expf(dt_vec[i]));
+        }
+    }
+
+    /* Skip conv for loop (just apply SiLU directly) */
+    for (int i = 0; i < loop_conv_dim; i++) {
+        conv_out[i] = ssm_silu(xBC_vec[i]);
+    }
+
+    /* Split → x_ssm, B, C */
+    float *x_ssm = conv_out;
+    float *B_flat = conv_out + loop_d_inner;
+    float *C_flat = conv_out + loop_d_inner + loop_d_state;
+
+    /* Inner norm */
+    if (wt->loop_inner_norm) {
+        float *tmp = (float *)malloc(loop_d_inner * sizeof(float));
+        if (tmp) {
+            memcpy(tmp, x_ssm, loop_d_inner * sizeof(float));
+            ssm_rmsnorm(x_ssm, tmp, wt->loop_inner_norm, loop_d_inner);
+            free(tmp);
+        }
+    }
+
+    /* Per-head SSM scan (stateless — fresh h each time) */
+    float *h_temp = (float *)calloc((size_t)loop_nheads * loop_headdim * loop_d_state, sizeof(float));
+    if (h_temp) {
+        for (int head = 0; head < loop_nheads; head++) {
+            float *B_vec = B_flat;  /* ngroups=1 so all heads share */
+            float *C_vec = C_flat;
+            float *h = h_temp + (size_t)head * loop_headdim * loop_d_state;
+            float *x_h = x_ssm + head * loop_headdim;
+            float *y_h = y_out + head * loop_headdim;
+
+            float A_val = wt->loop_A_log ? -expf(wt->loop_A_log[head]) : -1.0f;
+            float dt_h  = dt_vec[head];
+            float D_h   = wt->loop_D ? wt->loop_D[head] : 1.0f;
+
+            for (int d = 0; d < loop_headdim; d++) {
+                float x_t = x_h[d];
+                float y_t = 0.0f;
+                for (int n = 0; n < loop_d_state; n++) {
+                    float r = expf(dt_h * A_val);
+                    h[d * loop_d_state + n] = r * h[d * loop_d_state + n] + dt_h * B_vec[n] * x_t;
+                    y_t += h[d * loop_d_state + n] * C_vec[n];
+                }
+                y_h[d] = y_t + D_h * x_t;
+            }
+        }
+        free(h_temp);
+    }
+
+    /* Gate: y * SiLU(z) */
+    float *gated = y_out;  /* reuse in-place */
+    for (int i = 0; i < loop_d_inner; i++) {
+        gated[i] = y_out[i] * ssm_silu(z_vec[i]);
+    }
+
+    /* out_proj + residual */
+    if (wt->loop_out_proj)
+        ssm_matvec(proj_out, wt->loop_out_proj, gated, d_model, loop_d_inner);
+    else
+        memset(proj_out, 0, d_model * sizeof(float));
+
+    for (int i = 0; i < d_model; i++) x[i] += proj_out[i];
+
+    /* Loop norm */
+    if (wt->loop_norm_weight) {
+        float *tmp = (float *)malloc(d_model * sizeof(float));
+        if (tmp) {
+            memcpy(tmp, x, d_model * sizeof(float));
+            ssm_rmsnorm(x, tmp, wt->loop_norm_weight, d_model);
+            free(tmp);
+        }
+    }
+
+    free(proj_buf); free(conv_out); free(y_out); free(proj_out);
 }
 
 /* ── RLF Recursive Inference ──────────────────────────────────────────────── */
@@ -685,35 +561,28 @@ void mamba_rlf_infer(
 )
 {
     /**
-     * RLF recursive inference loop.
-     *
-     * Ported from RecursiveMamba2_v34.forward() inference path:
-     *   1. Encode full prompt through all layers → x
-     *   2. Save x_prompt = x.clone().detach()  (Prompt Lifeline anchor)
-     *   3. For each loop_i in range(MAX_LOOPS):
-     *      a. x = lifeline_inject(x, x_prompt)    — gradient shortcut
-     *      b. x = loop_rope(x, loop_i)            — RoPE loop encoding
-     *      c. x = LoRA_layers(x)                  — top layers forward
-     *      d. x = x + mamba2_core(x)              — SSM reasoning block
-     *      e. x = loop_norm(x)
-     *      f. logits = lm_head(final_norm(x))
-     *      g. if argmax == <HALT>: break
+     * RLF recursive inference loop with Latent Bridge.
      */
-    int d_model = cfg->d_model;
-    int max_loops = cfg->max_rlf_loops;
+    int d_model    = cfg->d_model;
+    int max_loops  = cfg->max_rlf_loops;
+    int bridge_rank = cfg->bridge_rank;
 
     if (!result || !prompt_ids || !cfg || !wt || !state) return;
     memset(result, 0, sizeof(*result));
 
-    /* 1. Encode prompt through full model */
-    float *x = (float *)calloc(d_model, sizeof(float));
-    float *x_prompt = (float *)calloc(d_model, sizeof(float));
-    float *logits = (float *)calloc(cfg->vocab_size, sizeof(float));
-    if (!x || !x_prompt || !logits) {
-        free(x); free(x_prompt); free(logits);
+    float *x         = (float *)calloc(d_model, sizeof(float));
+    float *x_prompt  = (float *)calloc(d_model, sizeof(float));
+    float *logits    = (float *)calloc(cfg->vocab_size, sizeof(float));
+    float *x_buf     = (float *)malloc(d_model * sizeof(float));
+    float *x_norm    = (float *)malloc(d_model * sizeof(float));
+    float *bridge_t  = bridge_rank > 0 ? (float *)malloc(bridge_rank * sizeof(float)) : NULL;
+
+    if (!x || !x_prompt || !logits || !x_buf || !x_norm) {
+        free(x); free(x_prompt); free(logits); free(x_buf); free(x_norm); free(bridge_t);
         return;
     }
 
+    /* 1. Encode prompt through full model */
     mamba_state_reset(state, cfg);
     for (int t = 0; t < prompt_len; t++) {
         mamba_forward(x, prompt_ids[t], cfg, wt, state);
@@ -724,65 +593,59 @@ void mamba_rlf_infer(
 
     /* 3. Recursive inference loop */
     for (int loop_i = 0; loop_i < max_loops && loop_i < 64; loop_i++) {
-        /* a. Lifeline injection (gated for ablation testing) */
-        if (cfg->lifeline_enabled && wt->lifeline_gate) {
+        /* a. Lifeline injection */
+        if (cfg->lifeline_enabled && wt->lifeline_gate)
             ssm_lifeline_inject(x, x_prompt, wt->lifeline_gate, d_model);
-        }
 
         /* b. RoPE loop encoding */
         ssm_rope_apply(x, d_model, loop_i, cfg->rope_base);
 
         /* c. Top layers (base_split to n_layers) */
-        float x_buf[2048];
-        if (d_model <= 2048) {
-            for (int l = cfg->base_split; l < cfg->n_layers; l++) {
-                mamba_block_forward(x_buf, x, l, cfg, wt, state);
-                memcpy(x, x_buf, d_model * sizeof(float));
-            }
+        for (int l = cfg->base_split; l < cfg->n_layers; l++) {
+            mamba2_block_forward(x_buf, x, l, cfg, wt, state);
+            memcpy(x, x_buf, d_model * sizeof(float));
         }
 
-        /* d. Mamba2 loop core (reasoning SSM block) */
+        /* d. Loop engine */
         ssm_rlf_loop_block(x, cfg, wt);
 
-        /* e. Final norm → logits */
-        float x_norm[2048];
-        if (wt->final_norm_weight && d_model <= 2048) {
-            ssm_rmsnorm(x_norm, x, wt->final_norm_weight, d_model);
-        } else {
-            memcpy(x_norm, x, d_model * sizeof(float));
+        /* e. Latent Bridge: x += bridge_up(bridge_down(x)) */
+        if (bridge_rank > 0 && bridge_t && wt->bridge_down && wt->bridge_up) {
+            ssm_matvec(bridge_t, wt->bridge_down, x, bridge_rank, d_model);
+            ssm_matvec(x_norm, wt->bridge_up, bridge_t, d_model, bridge_rank);
+            for (int i = 0; i < d_model; i++) x[i] += x_norm[i];
         }
 
-        /* f. lm_head: logits = W @ x_norm */
+        /* f. Final norm → logits */
+        if (wt->final_norm_weight)
+            ssm_rmsnorm(x_norm, x, wt->final_norm_weight, d_model);
+        else
+            memcpy(x_norm, x, d_model * sizeof(float));
+
         ssm_matvec(logits, wt->lm_head, x_norm, cfg->vocab_size, d_model);
         ssm_softmax(logits, cfg->vocab_size);
 
-        int pred_tok = ssm_argmax(logits, cfg->vocab_size);
-        float conf = logits[pred_tok];
-        int is_halt = (pred_tok == cfg->halt_token_id) ? 1 : 0;
+        int pred = ssm_argmax(logits, cfg->vocab_size);
+        float conf = logits[pred];
 
-        /* Record trace */
         result->trace[loop_i].loop_index     = loop_i;
-        result->trace[loop_i].predicted_token = pred_tok;
+        result->trace[loop_i].predicted_token = pred;
         result->trace[loop_i].confidence      = conf;
-        result->trace[loop_i].is_halt         = is_halt;
+        result->trace[loop_i].is_halt         = (pred == cfg->halt_token_id) ? 1 : 0;
         result->n_loops = loop_i + 1;
 
-        if (is_halt) {
-            /* Use previous loop's answer as final */
+        if (pred == cfg->halt_token_id) {
             if (loop_i > 0) {
                 result->final_token = result->trace[loop_i - 1].predicted_token;
                 result->final_conf  = result->trace[loop_i - 1].confidence;
             }
             break;
         }
-
-        result->final_token = pred_tok;
+        result->final_token = pred;
         result->final_conf  = conf;
     }
 
-    free(x);
-    free(x_prompt);
-    free(logits);
+    free(x); free(x_prompt); free(logits); free(x_buf); free(x_norm); free(bridge_t);
 }
 
 /* ── Standard Greedy Generation ───────────────────────────────────────────── */
@@ -799,154 +662,68 @@ int mamba_generate(
 )
 {
     /**
-     * Standard autoregressive generation (no RLF loop).
-     * For regular language model use (non-reasoning queries).
+     * Greedy autoregressive generation.
      */
     int d_model = cfg->d_model;
-    float *x = (float *)calloc(d_model, sizeof(float));
+    float *x      = (float *)calloc(d_model, sizeof(float));
+    float *x_norm = (float *)malloc(d_model * sizeof(float));
     float *logits = (float *)calloc(cfg->vocab_size, sizeof(float));
-    if (!x || !logits) { free(x); free(logits); return 0; }
+    if (!x || !x_norm || !logits) { free(x); free(x_norm); free(logits); return 0; }
 
     mamba_state_reset(state, cfg);
 
-    /* Encode prompt */
-    for (int t = 0; t < prompt_len; t++) {
+    /* Process prompt */
+    for (int t = 0; t < prompt_len; t++)
         mamba_forward(x, prompt_ids[t], cfg, wt, state);
-    }
 
     /* Generate */
-    int n_gen = 0;
-    for (int g = 0; g < max_gen; g++) {
-        /* logits = lm_head @ x */
-        ssm_matvec(logits, wt->lm_head, x, cfg->vocab_size, d_model);
+    int gen = 0;
+    for (int i = 0; i < max_gen; i++) {
+        if (wt->final_norm_weight)
+            ssm_rmsnorm(x_norm, x, wt->final_norm_weight, d_model);
+        else
+            memcpy(x_norm, x, d_model * sizeof(float));
 
-        int tok = ssm_sample_topk(logits, cfg->vocab_size, temperature, 5);
-        out_tokens[n_gen++] = tok;
+        ssm_matvec(logits, wt->lm_head, x_norm, cfg->vocab_size, d_model);
 
-        /* Check EOS */
-        if (tok == 0) break;
+        if (temperature > 0.0f) {
+            for (int v = 0; v < cfg->vocab_size; v++) logits[v] /= temperature;
+        }
+        ssm_softmax(logits, cfg->vocab_size);
 
-        /* Feed back */
+        int tok = ssm_argmax(logits, cfg->vocab_size);
+        out_tokens[gen++] = tok;
+
         mamba_forward(x, tok, cfg, wt, state);
     }
 
-    free(x);
-    free(logits);
-    return n_gen;
+    free(x); free(x_norm); free(logits);
+    return gen;
 }
 
-/* ── SSM Telemetry ────────────────────────────────────────────────────────── */
-
-/* Global telemetry instance — OO engines read from this */
-static SsmTelemetry g_ssm_telemetry;
-
-SsmTelemetry *ssm_get_telemetry(void)
-{
-    /**
-     * Get pointer to global telemetry struct.
-     * OO engines call this to read SSM metrics.
-     */
-    return &g_ssm_telemetry;
-}
+/* ── Telemetry helpers ────────────────────────────────────────────────────── */
 
 void ssm_analyze_lifeline(SsmTelemetry *telem, const float *gate, int d_model)
 {
     /**
-     * Analyze lifeline gate to compute RAM/ALU partition:
-     * - RAM dims: gate > mean+1σ  (amplify prompt — memory retrieval)
-     * - ALU dims: gate < mean-1σ  (suppress prompt — computation)
-     *
-     * From PAPER.md: "16.1% RAM, 2.0% ALU" — the model evolved
-     * a von Neumann architecture in its gate vector.
+     * Analyze lifeline gate for RAM/ALU partitioning.
      */
     if (!telem || !gate || d_model <= 0) return;
-
-    /* Compute mean */
-    float sum = 0.0f;
-    for (int i = 0; i < d_model; i++) sum += gate[i];
-    float mean = sum / (float)d_model;
-
-    /* Compute std dev */
-    float var = 0.0f;
-    for (int i = 0; i < d_model; i++) {
-        float d = gate[i] - mean;
-        var += d * d;
-    }
-    float std = sqrtf(var / (float)d_model);
-
-    /* Count RAM and ALU dims */
-    float ram_thresh = mean + std;
-    float alu_thresh = mean - std;
-    int ram = 0, alu = 0;
-    for (int i = 0; i < d_model; i++) {
-        if (gate[i] > ram_thresh) ram++;
-        if (gate[i] < alu_thresh) alu++;
-    }
-
-    telem->lifeline_mean = mean;
-    telem->lifeline_std  = std;
-    telem->lifeline_ram_dims = ram;
-    telem->lifeline_alu_dims = alu;
-    telem->lifeline_ram_frac = (float)ram / (float)d_model;
-    telem->lifeline_alu_frac = (float)alu / (float)d_model;
+    float sum = 0.0f, sum2 = 0.0f;
+    for (int i = 0; i < d_model; i++) { sum += gate[i]; sum2 += gate[i]*gate[i]; }
+    telem->lifeline_mean = sum / d_model;
+    telem->lifeline_std = sqrtf(sum2/d_model - telem->lifeline_mean*telem->lifeline_mean);
 }
 
 float ssm_entropy(const float *probs, int n)
 {
     /**
-     * Compute Shannon entropy of probability distribution in bits.
-     * H = -Σ p * log2(p)
-     * Lower entropy = more certain prediction.
+     * Compute entropy in bits.
      */
-    float h = 0.0f;
+    if (!probs || n <= 0) return 0.0f;
+    float e = 0.0f;
     for (int i = 0; i < n; i++) {
-        if (probs[i] > 1e-10f) {
-            h -= probs[i] * log2f(probs[i]);
-        }
+        if (probs[i] > 1e-10f) e -= probs[i] * log2f(probs[i]);
     }
-    return h;
-}
-
-void ssm_compute_output_stats(SsmTelemetry *telem, const float *logits, int vocab_size)
-{
-    /**
-     * Compute output distribution statistics from logits.
-     * Modifies a copy — does not alter the input logits.
-     */
-    if (!telem || !logits || vocab_size <= 0) return;
-
-    /* Find top-1 and top-5 from logits */
-    float max_val = logits[0];
-    for (int i = 1; i < vocab_size; i++) {
-        if (logits[i] > max_val) max_val = logits[i];
-    }
-
-    /* Compute softmax on-the-fly and entropy */
-    float sum = 0.0f;
-    float top5[5] = {0};
-    for (int i = 0; i < vocab_size; i++) {
-        float p = expf(logits[i] - max_val);
-        sum += p;
-        /* Track top 5 */
-        for (int j = 0; j < 5; j++) {
-            if (p > top5[j]) {
-                for (int k = 4; k > j; k--) top5[k] = top5[k-1];
-                top5[j] = p;
-                break;
-            }
-        }
-    }
-
-    float inv = 1.0f / sum;
-    telem->output_top1_prob = top5[0] * inv;
-    telem->output_top5_prob = 0.0f;
-    for (int j = 0; j < 5; j++) telem->output_top5_prob += top5[j] * inv;
-
-    /* Entropy */
-    float h = 0.0f;
-    for (int i = 0; i < vocab_size; i++) {
-        float p = expf(logits[i] - max_val) * inv;
-        if (p > 1e-10f) h -= p * log2f(p);
-    }
-    telem->output_entropy = h;
+    return e;
 }
