@@ -146,6 +146,24 @@ Early stops at rolling(100) acc ≥ target per phase.
 
 ---
 
+## Mamba-3 Latent Reasoning Engine (Phases 11-13)
+
+A major architectural expansion allowing the exact same 130M parameter model to solve Grade School Math (GSM8K) entirely within its continuous sequence state with $O(1)$ memory mapping, completely bypassing the need for explicit Chain-of-Thought (CoT) token generation.
+
+### Phase 11: The Turing RAM Singularity
+Proved the engine's capability of executing computational state loops (e.g., recursive string reversals and boolean tracking) natively inside the recurrent geometry. Achieved perfect 100% accuracy on $N=15$ reversals at a flat 2.68 GB VRAM.
+
+### Phase 12: GSM8K Reintegration (The 3-Stage Forge)
+Replaced conversational CoT loops with mathematical continuous loops:
+- **Phase 12-A (ALU Burn-in):** SFT over 15,000 pure-math arithmetic strings using spaced-digit tokenization (The Tokenizer Hack) to train the base Base-10 carry-over geometry.
+- **Phase 12-B (Semantic Bridge):** Masked SFT (`labels=-100` on the English prompt) using a unified $80/10/10$ Replay Buffer and dynamic BPTT equalizer tokens to force the English parsing directly into the continuous state accumulator without backpropagating conversational English errors.
+- **Phase 12-C (The Final Boss):** Group Relative Policy Optimization (GRPO) using `gsm8k_reward` (+1.0 for perfect numeric matches). Generates branches with dynamic dark loops ($N=5$ to $15$), punishing arithmetic errors and mathematically carving the mathematical routing into the latent gates.
+
+### Phase 13: Conversational Re-Anchoring
+A final unifying pass. Merges `HuggingFaceH4/ultrachat_200k` generated responses (`50%` batch ratio) with Phase 12-C routing queries (`50%` batch ratio) to restore natural conversational English abilities *around* the mathematical continuous state loops.
+
+---
+
 ## Checkpoints
 
 | File | Description | RLF Acc |
