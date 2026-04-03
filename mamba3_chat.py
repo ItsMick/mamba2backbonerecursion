@@ -24,7 +24,7 @@ from transformers import AutoTokenizer
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 D_MODEL = 768
-HALT_THRESHOLD = 0.70
+HALT_THRESHOLD = 0.50
 MAX_LOOPS = 30
 MIN_LOOPS = 1
 ROMI_PERIOD = 5
@@ -82,20 +82,12 @@ def inner_loop_generate(
     """
     Phase 14 inference: HaltingHead-steered inner-loop bypass.
 
-    The LM Head fires ONCE at the end — not per tick. This makes
-    inference latency proportional to ticks × SSM layer compute,
-    while VRAM stays flat regardless of loop count (O(1) memory).
-
-    Returns:
-        answer_text: Decoded model output
-        n_loops: Number of SSM ticks HaltingHead decided to run
-        peak_vram_gb: Peak GPU memory during inference
-        latency_ms: Wall-clock time for the full inference pass
+    Prompt is silently formatted as "Problem: ...\nSolution: " to match
+    the exact Phase 12-C GRPO training distribution, regardless of what
+    the user typed.
     """
-    prefix = "[LOGIC] " if any(
-        kw in problem.lower() for kw in ["what", "how", "many", "total", "sum", "if"]
-    ) else "[CHAT] "
-    prompt_text = f"{prefix}{problem}\nSolution: "
+    # Native training format — this is what the model was GRPO-trained on
+    prompt_text = f"Problem: {problem}\nSolution: "
 
     input_ids = tokenizer.encode(prompt_text, return_tensors="pt").to(DEVICE)
 
@@ -181,10 +173,7 @@ def autoregressive_generate(
     temperature: float = 0.3,
 ) -> tuple[str, int, float, float]:
     """Legacy Phase 13 inference with fixed autoregressive dark loops."""
-    prefix = "[LOGIC] " if any(
-        kw in problem.lower() for kw in ["what", "how", "many", "total", "sum", "if"]
-    ) else "[CHAT] "
-    prompt = f"{prefix}{problem}\nSolution: " + "=" * n_loops
+    prompt = f"Problem: {problem}\nSolution: "
 
     input_ids = tokenizer.encode(prompt, return_tensors="pt").to(DEVICE)
     torch.cuda.reset_peak_memory_stats(DEVICE) if DEVICE == "cuda" else None

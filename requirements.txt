@@ -1,8 +1,23 @@
+# Mamba Latent Reasoning Engine — 2.8B
+# Tested on Python 3.10-3.14, CUDA 12.x, RTX 3060 12GB
+
+# Core
 torch>=2.1.0
-transformers>=4.36.0
-mamba-ssm>=2.0.0
-causal-conv1d>=1.2.0
-triton>=2.1.0
-tokenizers>=0.15.0
-numpy
+transformers>=4.40.0
+datasets>=2.18.0
+accelerate>=0.27.0
+
+# Mamba SSM kernel
+mamba-ssm>=1.2.0
+causal-conv1d>=1.1.0
+
+# Training
+einops>=0.7.0
+sentencepiece>=0.1.99
+
+# Evaluation
+lm-eval>=0.4.0
+
+# Utilities
 tqdm
+numpy

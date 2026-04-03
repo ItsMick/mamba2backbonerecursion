@@ -199,7 +199,9 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
             
             data = {"step": "--", "loss": "--", "reward": "--", "vram": "--", "logs": []}
             # Priority: always show the most recent active phase
-            if os.path.exists("training_p14.log") and os.path.getsize("training_p14.log") > 0:
+            if os.path.exists("training_p14b.log") and os.path.getsize("training_p14b.log") > 0:
+                log_file = "training_p14b.log"
+            elif os.path.exists("training_p14.log") and os.path.getsize("training_p14.log") > 0:
                 log_file = "training_p14.log"
             elif os.path.exists("training_p13.log") and os.path.getsize("training_p13.log") > 0:
                 log_file = "training_p13.log"
@@ -220,13 +222,21 @@ class MonitorHandler(http.server.SimpleHTTPRequestHandler):
                     
                     # Back-scan for latest stats across all phase log formats
                     for line in reversed(lines):
+                        # Phase 14-B format: [P14B S00025] BCE Loss: X | P(halt@tickN): X | VRAM: X GB
+                        m14b = re.search(r"\[P14B S(\d+)\].*BCE Loss:\s*([\d\.]+).*P\(halt@tick\d+\):\s*([\d\.]+).*VRAM:\s*([\d\.]+)", line)
                         # Phase 14 format: [P14 S00050] LM Loss: X | Halt Loss: X | Avg Loops: X | VRAM: X GB
                         m14 = re.search(r"\[P14 S(\d+)\].*LM Loss:\s*([\d\.]+).*Halt Loss:\s*([\d\.]+).*Avg Loops:\s*([\d\.]+).*VRAM:\s*([\d\.]+\s*GB)", line)
                         # Phase 13 format: [PHASE 13 S0050] Universal Target Masked Loss: X
                         m13 = re.search(r"\[PHASE 13 S(\d+)\].*Loss:\s*([\d\.]+)", line)
                         # Legacy GRPO format: [E1 S0190 G00191] Loss: X | R: X | VRAM: X GB
                         mgrpo = re.search(r"(?:\[E\d+ S\d+ G(\d+)\]|\[(\d+)\]) Loss:\s*([-\d\.]+).*?R:\s*([-\d\.]+).*?VRAM:\s*([\d\.]+\s*GB)", line)
-                        if m14:
+                        if m14b:
+                            data["step"] = m14b.group(1)
+                            data["loss"] = m14b.group(2)
+                            data["reward"] = f"p_halt:{m14b.group(3)}"
+                            data["vram"] = f"{m14b.group(4)} GB"
+                            break
+                        elif m14:
                             data["step"] = m14.group(1)
                             data["loss"] = m14.group(2)
                             data["reward"] = f"loops:{m14.group(4)}"
