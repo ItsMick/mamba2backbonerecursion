@@ -9,12 +9,14 @@ import torch
 import sys
 import os
 
-# Apply CPU patches before any fla import
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from rwkv7.cpu_patch import apply_cpu_patches
-apply_cpu_patches()
-
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# Only apply CPU patches when there's no GPU — on CUDA, fla's native
+# Triton kernels are faster and correct.
+if DEVICE == "cpu":
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from rwkv7.cpu_patch import apply_cpu_patches
+    apply_cpu_patches()
 MODEL_ID = "RWKV/RWKV7-Goose-World2.8-0.1B-HF"
 FALLBACK_ID = "RWKV/RWKV7-Goose-World3-1.5B-HF"
 
@@ -32,11 +34,14 @@ def inspect_model(model_id: str):
     print(f"  Vocab size: {tok.vocab_size}")
 
     print("[2/5] Loading model...")
+    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
     model = AutoModelForCausalLM.from_pretrained(
-        model_id, dtype=torch.float32,
+        model_id, dtype=dtype,
+        device_map="auto" if DEVICE == "cuda" else None,
         trust_remote_code=True,
     )
-    model = model.to(DEVICE)
+    if DEVICE == "cpu":
+        model = model.to(DEVICE)
     model.config.use_cache = True
     model.eval()
     print(f"  Model class: {type(model).__name__}")
